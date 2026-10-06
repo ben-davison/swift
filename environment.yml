@@ -1,0 +1,19 @@
+name: swift_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - cmcrameri
+  - cmocean
+  - geopandas
+  - matplotlib
+  - numpy
+  - pandas
+  - pdemtools
+  - pyproj
+  - rasterio
+  - rioxarray
+  - scipy
+  - shapely
+  - xarray

@@ -207,4 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 # Directories
-data/raw
+data/raw/images
+data/raw/bedmachine
+data/raw/vel
