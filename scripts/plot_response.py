@@ -1,14 +1,15 @@
 import os
 import warnings
-import numpy as np
-import pandas as pd
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource, Normalize, LinearSegmentedColormap
 from matplotlib.gridspec import GridSpec
 import matplotlib.ticker as ticker
 import matplotlib.dates as mdates
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from scipy.signal import savgol_filter, find_peaks
+import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
 from functools import lru_cache
 import rasterio
 import rioxarray as rxr
@@ -22,6 +23,14 @@ import glob
 import re
 
 # ==========================================
+# PUBLICATION QUALITY SETTINGS
+# ==========================================
+# Ensures fonts are exported as editable text in PDF/SVG rather than paths
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.rcParams['ps.fonttype'] = 42
+mpl.rcParams['svg.fonttype'] = 'none'
+
+# ==========================================
 # 1. PATH DEFINITIONS
 # ==========================================
 BASE_DIR = "/mnt/parscratch/users/gg1bjd/research/swift/data"
@@ -29,9 +38,8 @@ RAW_VEL_S2 = f"{BASE_DIR}/raw/vel/sentinel2"
 RAW_VEL_LS = f"{BASE_DIR}/raw/vel/landsat"
 BOUNDS_SHP = f"{BASE_DIR}/raw/vector/bounds/bounds.shp"
 FLOWLINE_SHP = f"{BASE_DIR}/raw/vector/flowline/flowline.shp"
-#BEDMACHINE_NC = f"{BASE_DIR}/raw/bedmachine/NSIDC-0756_BedMachineAntarctica_19700101-20191001_V04.1.nc"
 BEDMACHINE_NC = f"{BASE_DIR}/raw/bedmachine/BedMachineAntarctica-v3.nc"
-REMA_OUT = f"{BASE_DIR}/raw/images/rema/rema_10m_geoid_masked.tif"
+REMA_OUT = f"{BASE_DIR}/pub/images/rema/rema_10m_geoid_masked.tif"
 TERMINUS_SHP = f"{BASE_DIR}/raw/vector/terminus/swift_terminus.shp"
 TERMINUS_CSV = f"{BASE_DIR}/raw/vector/terminus/swift.csv"
 DZ_PUB_DIR = f"{BASE_DIR}/pub/dz"
@@ -77,6 +85,14 @@ LST_list = [
     'S_50m_20131030_20140118'
 ]
 
+# Extract min/max dates for Panel A annotation
+all_pre_dates = []
+for f in SE2_list + LST_list:
+    parts = f.split('_')
+    if len(parts) >= 4:
+        all_pre_dates.extend([pd.to_datetime(parts[2]), pd.to_datetime(parts[3])])
+pre_date_str = f"{min(all_pre_dates).strftime('%Y%m%d')}-{max(all_pre_dates).strftime('%Y%m%d')}"
+
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -97,46 +113,20 @@ def hillshade(dem, azimuth=180, angle_altitude=45, vert_exag=8.0, dx=10.0, dy=10
     ls = LightSource(azdeg=azimuth, altdeg=angle_altitude)
     return ls.hillshade(dem, vert_exag=vert_exag, dx=dx, dy=dy)
 
-#ls = LightSource(azdeg=315, altdeg=45)
-
 def apply_imageschs(data, background, cmap, norm, weight=0.5, alpha=1.0):
-    """
-    Replicates MATLAB's TopoToolbox / CDT 'imageschs' multiplicative blending.
-    
-    Parameters
-    ----------
-    data : 2D numpy array or DataArray
-        The spatial overlay data (e.g. ice speed). NaNs display as pure background.
-    background : 2D numpy array or DataArray
-        The DEM hillshade array or SAR backscatter image.
-    cmap : Matplotlib Colormap
-    norm : Matplotlib Normalize object
-    weight : float, default 0.5
-        Controls texture contrast (0.2 = subtle texture, 0.7 = strong relief shadows).
-    """
     data_arr = np.asarray(data)
     bg_arr = np.asarray(background)
     
-    # 1. Normalize background grayscale map to [0, 1]
     bg_min, bg_max = np.nanmin(bg_arr), np.nanmax(bg_arr)
     bg_norm = (bg_arr - bg_min) / (bg_max - bg_min) if bg_max > bg_min else np.zeros_like(bg_arr)
     
-    # 2. Map overlay data to RGB array
     rgb = cmap(norm(data_arr))[:, :, :3]
-    
-    # 3. Multiplicative shading factor (modulates light without touching hue/saturation)
     shading_factor = (1.0 - weight) + weight * bg_norm
-    
-    # 4. Apply texture to the colored data
     textured_rgb = rgb * shading_factor[..., np.newaxis]
-    
-    # 5. Create pure grayscale RGB background
     bg_rgb = np.stack([bg_norm, bg_norm, bg_norm], axis=-1)
     
-    # 6. Blend textured color with pure background based on alpha
     blended = (textured_rgb * alpha) + (bg_rgb * (1.0 - alpha))
     
-    # 7. Restore pure grayscale background where data has NaNs/gaps
     nan_mask = np.isnan(data_arr)
     for c in range(3):
         blended[:, :, c][nan_mask] = bg_norm[nan_mask]
@@ -336,11 +326,9 @@ def _process_single_site_multi(ds, geometry, target_crs, buffer, sources, gap_fi
 # ==========================================
 bounds_gdf = gpd.read_file(BOUNDS_SHP)
 
-# --- A. Master Grid Setup ---
 master_ref = rxr.open_rasterio(f"{RAW_VEL_S2}/S/{SE2_list[0]}.tif").squeeze().drop_vars("band", errors="ignore")
 master_grid = master_ref.rio.clip(bounds_gdf.geometry, bounds_gdf.crs)
 
-# --- B. Process or Load Pre-Landslide Mean Velocities & DEM ---
 if os.path.exists(PRE_MEAN_S) and os.path.exists(REMA_OUT):
     print("Loading cached pre-landslide means and DEM...")
     pre_S = rxr.open_rasterio(PRE_MEAN_S).squeeze()
@@ -378,9 +366,8 @@ else:
             
     elev_mask = (rema_dem <= 1100) & (rema_dem >= 5)
     
-    # FIX: Replaced trim_mean with np.nanmedian to handle NaNs properly while rejecting outliers
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning) # Ignore all-NaN slice warnings
+        warnings.simplefilter("ignore", category=RuntimeWarning)
         pre_S = xr.DataArray(np.nanmedian(np.stack(stacks['S']), axis=0), coords=master_grid.coords, dims=['y', 'x']).where(elev_mask)
         pre_U = xr.DataArray(np.nanmedian(np.stack(stacks['U']), axis=0), coords=master_grid.coords, dims=['y', 'x']).where(elev_mask)
         pre_V = xr.DataArray(np.nanmedian(np.stack(stacks['V']), axis=0), coords=master_grid.coords, dims=['y', 'x']).where(elev_mask)
@@ -389,7 +376,6 @@ else:
     pre_U.rio.to_raster(PRE_MEAN_U)
     pre_V.rio.to_raster(PRE_MEAN_V)
 
-# --- C. Process or Load Post-Landslide Speed Change & S1 DB ---
 if os.path.exists(S1_S_CHANGE_OUT) and os.path.exists(S1_BG_OUT):
     print("Loading cached S1 speed change and backscatter...")
     s1_change_pct = rxr.open_rasterio(S1_S_CHANGE_OUT).squeeze()
@@ -412,23 +398,19 @@ num_pts = len(flowline_pts)
 cmap_amp = cmocean.cm.amp
 colors_flowline = [cmap_amp(i / num_pts) for i in range(num_pts)]
 
-# --- Define Global Temporal Bounds ---
 start_date = pd.to_datetime('2018-01-01')
 end_date = pd.to_datetime('2019-07-31')
 landslide_date = pd.to_datetime('2018-04-14 06:38:32')
 
-# --- Process / Load Terminus Data ---
 print("Loading terminus vector and CSV data...")
 term_gdf = gpd.read_file(TERMINUS_SHP)
 if term_gdf.crs and term_gdf.crs.to_epsg() == 4326:
     term_gdf = term_gdf.to_crs(epsg=3031)
 
-# Clip the terminus shapefile to the bounds shapefile
 bounds_gdf_proj = bounds_gdf.to_crs(term_gdf.crs)
 term_gdf = gpd.clip(term_gdf, bounds_gdf_proj)
 
 term_gdf['Date'] = pd.to_datetime(term_gdf['Date'])
-# Filter shapefile geometries to our specific date window
 term_gdf = term_gdf[(term_gdf['Date'] >= start_date) & (term_gdf['Date'] <= end_date)]
 term_gdf['date_num'] = mdates.date2num(term_gdf['Date'])
 
@@ -436,9 +418,6 @@ term_df = pd.read_csv(TERMINUS_CSV)
 term_df['Date'] = pd.to_datetime(term_df[['Year', 'Month', 'Day']])
 term_df['date_num'] = mdates.date2num(term_df['Date'])
 
-# Create unified colormap norm for both the shapefile and CSV
-#vmin_date = min(term_gdf['date_num'].min(), term_df['date_num'].min())
-#vmax_date = max(term_gdf['date_num'].max(), term_df['date_num'].max())
 vmin_date = mdates.date2num(start_date)
 vmax_date = mdates.date2num(end_date)
 date_norm = Normalize(vmin=vmin_date, vmax=vmax_date)
@@ -485,9 +464,7 @@ else:
                     'error': d["error"][j]
                 })
     pd.DataFrame(rows).to_csv(TS_CSV_OUT, index=False)
-    
-    
-# Elevation timeseries
+
 if os.path.exists(ELEV_CSV_OUT):
     print(f"Loading cached elevation timeseries from CSV: {ELEV_CSV_OUT}")
     elev_df = pd.read_csv(ELEV_CSV_OUT)
@@ -500,23 +477,19 @@ else:
     rows = []
     for fpath in rema_files:
         fname = os.path.basename(fpath)
-        # Parse date (YYYYMMDD) from filename
         match = re.search(r'(\d{8})', fname)
-        if not match:
-            continue
+        if not match: continue
         date_str = match.group(1)
         file_date = pd.to_datetime(date_str, format='%Y%m%d')
 
         try:
             with rxr.open_rasterio(fpath, masked=True) as da:
                 da = da.squeeze()
-                # Ensure CRS alignment with flowline points
                 if da.rio.crs != flowline_pts.crs:
                     da = da.rio.reproject(flowline_pts.crs)
                 
                 for i, pt in enumerate(flowline_pts.geometry):
                     site_name = f"Site_{i}"
-                    # Define 20x20m box (10m buffer in each direction)
                     x_min, x_max = pt.x - 10, pt.x + 10
                     y_min, y_max = pt.y - 10, pt.y + 10
                     
@@ -537,13 +510,10 @@ else:
             print(f"Warning: Could not process {fname}: {e}")
 
     elev_df = pd.DataFrame(rows)
-    
     if not elev_df.empty:
-        # Sort chronologically per site and calculate elevation change relative to first measurement
         elev_df = elev_df.sort_values(['site_id', 'Date']).reset_index(drop=True)
         elev_df['elevation_change'] = elev_df.groupby('site_id')['elevation'].transform(lambda x: x - x.iloc[0])
         elev_df.to_csv(ELEV_CSV_OUT, index=False)
-        print(f"Saved elevation timeseries to CSV: {ELEV_CSV_OUT}")
     else:
         print("No valid elevation data found across the provided DEMs.")
 
@@ -553,53 +523,46 @@ else:
 print("Generating figure...")
 fig = plt.figure(figsize=(7.5, 7), dpi=600, layout='constrained')
 
-# 6 rows x 2 columns setup
 gs = GridSpec(
     6, 2, 
     figure=fig, 
-    width_ratios=[1, 2],    # Timeseries col is 2x width of Map col
-    wspace=0.2,            # Space between cols for vertical colorbars
-    hspace=0.1             # Space between rows
+    width_ratios=[1, 2], 
+    wspace=0.2,
+    hspace=0.1
 )
 
-# Left Column: Maps (each spans 3 rows)
-ax1 = fig.add_subplot(gs[0:3, 0])  # Panel A
-ax2 = fig.add_subplot(gs[3:6, 0])  # Panel B
-
-# Right Column: Timeseries (each spans 2 rows)
-ax3 = fig.add_subplot(gs[0:2, 1])  # Panel C
-ax4 = fig.add_subplot(gs[2:4, 1])  # Panel D
-ax5 = fig.add_subplot(gs[4:6, 1])  # Panel E
+ax1 = fig.add_subplot(gs[0:3, 0])
+ax2 = fig.add_subplot(gs[3:6, 0])
+ax3 = fig.add_subplot(gs[0:2, 1])
+ax4 = fig.add_subplot(gs[2:4, 1])
+ax5 = fig.add_subplot(gs[4:6, 1])
 
 extent = [master_grid.x.min(), master_grid.x.max(), master_grid.y.min(), master_grid.y.max()]
 
-# --- Axes Formatting Helper for Panels A & B ---
 def format_map_axes(ax):
-    # Convert map coordinates (meters) to kilometers for the tick labels
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f"{x/1000:.0f}"))
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, pos: f"{y/1000:.0f}"))
     ax.set_xlabel("Easting (km)", fontsize=8)
     ax.set_ylabel("Northing (km)", fontsize=8)
     ax.tick_params(axis='both', which='major', labelsize=8)
 
-# --- Panel A: Top Left (Pre-landslide Velocity Map) ---
+# --- Panel A ---
 hs = hillshade(rema_dem.values)
-
-# Extract colors starting at 15% (skips the pitch black) to 100%
 batlow_colors = cmc.batlow(np.linspace(0.15, 1.0, 256))
 batlow_light = LinearSegmentedColormap.from_list('batlow_light', batlow_colors)
 
-# Apply imageschs multiplicative blend
 blended_map_a = apply_imageschs(
-    pre_S.values, 
-    hs, 
-    cmap=batlow_light, 
-    norm=Normalize(vmin=0, vmax=150), 
-    weight=0.55,  # Tune between 0.3 (subtle) and 0.7 (punchy)
-    alpha=0.85
+    pre_S.values, hs, cmap=batlow_light, 
+    norm=Normalize(vmin=0, vmax=150), weight=0.55, alpha=0.85
 )
 
-ax1.imshow(blended_map_a, extent=extent, origin='upper')
+# interpolation='nearest' ensures raster data remains crisp on zoom in PDFs
+ax1.imshow(blended_map_a, extent=extent, origin='upper', interpolation='nearest')
+
+# Add semi-transparent date range box
+ax1.text(0.96, 0.98, pre_date_str, transform=ax1.transAxes, 
+         fontsize=7, va='top', ha='right', zorder=20,
+         bbox=dict(facecolor=(1, 1, 1, 0.75), edgecolor='none', boxstyle='round,pad=0.3'))
 
 sm1 = plt.cm.ScalarMappable(cmap=cmc.batlow, norm=Normalize(vmin=0, vmax=150))
 sm1.set_array([])
@@ -609,17 +572,15 @@ cbar1 = plt.colorbar(sm1, cax=cax1, orientation='vertical')
 cbar1.set_label('Speed (m yr$^{-1}$)', fontsize=8)
 cbar1.ax.tick_params(labelsize=7)
 
-# Overlay terminus lines with date color coding
 for idx, row in term_gdf.iterrows():
     geom = row.geometry
     c = date_cmap(date_norm(row.date_num))
     if geom.geom_type == 'MultiLineString':
         for line in geom.geoms:
-            ax1.plot(*line.xy, color=c, linewidth=0.25, zorder=6)
+            ax1.plot(*line.xy, color=c, linewidth=0.1, zorder=6)
     else:
         ax1.plot(*geom.xy, color=c, linewidth=1.5, zorder=6)
 
-# Create Date Colorbar on the LEFT side of panel A so it doesn't clash with the speed colorbar
 sm_date = plt.cm.ScalarMappable(cmap=date_cmap, norm=date_norm)
 sm_date.set_array([])
 cax_date = inset_axes(ax1, width="6%", height="60%", loc='center left',
@@ -627,8 +588,6 @@ cax_date = inset_axes(ax1, width="6%", height="60%", loc='center left',
 cbar_date = plt.colorbar(sm_date, cax=cax_date, orientation='vertical')
 cbar_date.set_label('Terminus Date', fontsize=8)
 cbar_date.ax.yaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-#cax_date.yaxis.set_ticks_position('left')
-#cax_date.yaxis.set_label_position('left')
 cbar_date.ax.tick_params(labelsize=7)
 
 step = 7 
@@ -640,7 +599,6 @@ for i, point in enumerate(flowline_pts.geometry):
     ax1.plot(point.x, point.y, marker='o', markersize=3, color=colors_flowline[i], markeredgecolor='k', markeredgewidth=0.3)
 
 format_map_axes(ax1)
-
 sb_len = 2000  
 sb_x = extent[0] + (extent[1] - extent[0]) * 0.05
 sb_y = extent[2] + (extent[3] - extent[2]) * 0.05
@@ -650,17 +608,19 @@ ax1.text(sb_x + sb_len/2, sb_y + (extent[3] - extent[2]) * 0.02, '2 km',
 ax1.set_xlim([extent[0], extent[1]])
 ax1.set_ylim([extent[2], extent[3]])
 
-# --- Panel B: Top Right (Speed Change Map over SAR Backscatter) ---
+# --- Panel B ---
 blended_map_b = apply_imageschs(
-    s1_change_pct.values, 
-    s1_db.values, 
-    cmap=cmocean.cm.balance, 
-    norm=Normalize(vmin=-750, vmax=750), 
-    weight=0.55,
-    alpha=0.75
+    s1_change_pct.values, s1_db.values, cmap=cmocean.cm.balance, 
+    norm=Normalize(vmin=-750, vmax=750), weight=0.55, alpha=0.75
 )
 
-ax2.imshow(blended_map_b, extent=extent, origin='upper')
+# interpolation='nearest' ensures crisp boundaries
+ax2.imshow(blended_map_b, extent=extent, origin='upper', interpolation='nearest')
+
+# Add semi-transparent date box
+ax2.text(0.96, 0.98, "20180414", transform=ax2.transAxes, 
+         fontsize=7, va='top', ha='right', zorder=20,
+         bbox=dict(facecolor=(1, 1, 1, 0.75), edgecolor='none', boxstyle='round,pad=0.3'))
 
 sm2 = plt.cm.ScalarMappable(cmap=cmocean.cm.balance, norm=Normalize(vmin=-750, vmax=750))
 sm2.set_array([])
@@ -672,14 +632,26 @@ cbar2.ax.tick_params(labelsize=7)
 
 format_map_axes(ax2)
 
-# --- Panel C: Bottom (Timeseries) ---
+# --- Panel C: Timeseries & Kinematic Wave Analysis ---
+peak_dates = []
+peak_speeds = []
+distances = []
+site_ids = []
+
+# WIDENED window: Start from landslide day, stretch to late summer to ensure distal peaks are caught
+wave_search_start = pd.to_datetime('2018-04-14')
+wave_search_end = pd.to_datetime('2018-08-31')
+
 for i, idx in enumerate(flowline_pts.index):
+    # Skip the first 4 (slowest) timeseries from plotting and calculation
+    if i < 4:
+        continue
+    
     site_name = f"Site_{idx}"
     site_data = ts_results.get(site_name)
     
     if site_data and site_data.get("status") == "success":
         data = site_data["data"]
-        
         dates = pd.to_datetime(data["dates"])
         raw_speed = np.array(data["speed"]["raw"], dtype=float)
         smoothed_speed = np.array(data["speed"]["smoothed"], dtype=float)
@@ -693,88 +665,48 @@ for i, idx in enumerate(flowline_pts.index):
         ax3.plot(dates[valid_smooth], smoothed_speed[valid_smooth], 
                  color=colors_flowline[i], linewidth=1)
         
-# --- Kinematic Wave Analysis ---
-peak_dates = []
-peak_speeds = []
-distances = []
-site_ids = []
-
-# Define search window to isolate the landslide-induced wave
-wave_search_start = pd.to_datetime('2018-04-06')
-wave_search_end = pd.to_datetime('2018-05-15')
-wave_search_start = pd.to_datetime('2018-03-15')
-wave_search_end = pd.to_datetime('2018-07-15')
-
-for i, idx in enumerate(flowline_pts.index):
-    site_name = f"Site_{idx}"
-    site_data = ts_results.get(site_name)
-    
-    if site_data and site_data.get("status") == "success":
-        dates = pd.to_datetime(site_data["data"]["dates"])
-        smoothed = np.array(site_data["data"]["speed"]["smoothed"], dtype=float)
-        
-        # Mask using the newly defined isolated search window
-        mask = (dates >= wave_search_start) & (dates <= wave_search_end) & (~np.isnan(smoothed))
+        # Mask using the newly defined broader search window
+        mask = (dates >= wave_search_start) & (dates <= wave_search_end) & (~np.isnan(smoothed_speed))
         
         if np.any(mask):
             valid_dates = dates[mask]
-            valid_smoothed = smoothed[mask]
+            valid_smoothed = smoothed_speed[mask]
             
-            #max_idx = np.argmax(valid_smoothed)
-            #peak_date = valid_dates[max_idx]
-            peaks, properties = find_peaks(valid_smoothed, prominence=10)
+            # Replaced find_peaks with argmax. Far more robust for single major surge events
+            max_idx = np.argmax(valid_smoothed)
             
-            if len(peaks) > 0:
-                # If multiple peaks exist in the window, pick the most prominent one
-                #best_peak_idx = peaks[np.argmax(properties["prominences"])]
-                this_peak_speeds = valid_smoothed[peaks]
-                best_peak_idx = peaks[np.argmax(this_peak_speeds)]
-                
-                peak_dates.append(valid_dates[best_peak_idx])
-                peak_speeds.append(valid_smoothed[best_peak_idx])
-            
-            # Check if the peak is hitting the edge of our search window
-            #if peak_date == valid_dates.min() or peak_date == valid_dates.max():
-            #    print(f"Warning: {site_name} peak hit the search boundary ({peak_date}). Discarding.")
-            #    continue # Skip this site
-                
-            #peak_dates.append(peak_date)
-            #peak_speeds.append(valid_smoothed[max_idx])
+            peak_dates.append(valid_dates[max_idx])
+            peak_speeds.append(valid_smoothed[max_idx])
             distances.append(i * 250)
             site_ids.append(site_name)
+            
+            # Plot tiny 'x' markers on detected peaks so the calculation is fully transparent
+            ax3.plot(valid_dates[max_idx], valid_smoothed[max_idx], marker='x', 
+                     color='black', markersize=3.5, alpha=0.8, zorder=12)
 
 if len(peak_dates) > 1:
-    # 1. Line of best fit for Panel C (Amplitude vs Date)
     x_mdates = mdates.date2num(peak_dates)
     p_amp = np.polyfit(x_mdates, peak_speeds, 1)
     
-    # Plot dashed grey line through the peaks
+    # Because we expanded the time window, max(x_mdates) now covers the whole span
     x_line = np.linspace(min(x_mdates), max(x_mdates), 100)
     y_line = np.polyval(p_amp, x_line)
-    ax3.plot(mdates.num2date(x_line), y_line, color='grey', linestyle='--', linewidth=2, zorder=15)
+    ax3.plot(mdates.num2date(x_line), y_line, color='grey', linestyle='--', linewidth=1, zorder=15)
     
-    # 2. Calculate Kinematic Wave Speed (Distance vs Time)
     base_date = min(peak_dates)
     days_since = np.array([(d - base_date).total_seconds() / (24*3600) for d in peak_dates])
     
-    # Linear fit: Distance (m) = Wave_Speed (m/day) * Time (days) + C
     p_dist = np.polyfit(days_since, distances, 1)
     wave_speed_m_day = p_dist[0]
     
-    # Print metrics to console and add a clean text box to the plot
     print(f"\n--- Kinematic Wave Metrics ---")
     print(f"Wave Speed: {wave_speed_m_day:.1f} m/day")
-    
-    # Place text anchor relative to the upper-most right-most end of the line
-    line_end_date = mdates.num2date(x_line[-1])
-    line_end_speed = y_line[-1]
     
     text_str = f"Wave Speed: {wave_speed_m_day:.1f} m day$^{{-1}}$"
     ax3.text(0.98, 0.95, text_str, transform=ax3.transAxes, fontsize=7, 
              ha='right', va='top', zorder=20)
     
     WAVE_METRICS_CSV = f"{PUB_VEL_DIR}/wave_metrics.csv"
-    print(f"Saving wave metrics to CSV: {WAVE_METRICS_CSV}")
     metrics_df = pd.DataFrame({
         'site_id': site_ids,
         'distance_m': distances,
@@ -794,32 +726,28 @@ ax3.tick_params(axis='both', which='major', labelsize=8)
 ax3.tick_params(axis='x', which='major', labelsize=8, labelrotation=45)
 ax3.grid(True, linestyle=':', alpha=0.6)
 
-# --- Panel D: Bottom (Terminus Relative Position Timeseries) ---
-# Sort by date so the line connects properly chronologically
+# --- Panel D ---
 term_df_sorted = term_df.sort_values(by='Date')
 
-# Connecting line underneath
 ax4.plot(term_df_sorted['Date'], term_df_sorted['Terminus position relative to most recent observation (m)'],
          color='grey', linewidth=0.8, linestyle='-', zorder=2)
 
-# Scatter points coloured by the exact date (matching Panel A colormap)
 ax4.scatter(term_df_sorted['Date'], term_df_sorted['Terminus position relative to most recent observation (m)'],
             c=term_df_sorted['date_num'], cmap=date_cmap, norm=date_norm, 
             s=25, edgecolor='k', linewidth=0.4, zorder=3)
 
-# Adding the landslide marker to panel d for consistency
 ax4.axvline(plot_landslide_date, color='k', linestyle='--', linewidth=1.5, zorder=10)
 ax4.text(plot_landslide_date - pd.Timedelta(days=3), 750, 'Landslide', 
          rotation=90, va='top', ha='right', fontsize=8)
 
-ax4.set_xlim([start_date, end_date])  # Or comment this line to let ax4 autoscale the date range
+ax4.set_xlim([start_date, end_date]) 
 ax4.set_ylim([0, 750])
 ax4.set_ylabel("Rel. Terminus\nPosition (m)", fontsize=8)
 ax4.tick_params(axis='both', which='major', labelsize=8)
 ax4.tick_params(axis='x', which='major', labelsize=8, labelrotation=45)
 ax4.grid(True, linestyle=':', alpha=0.6)
 
-# --- Panel E: Bottom (Elevation Change Timeseries) ---
+# --- Panel E ---
 if 'elev_df' in locals() and not elev_df.empty:
     for i, idx in enumerate(flowline_pts.index):
         site_name = f"Site_{idx}"
@@ -830,12 +758,11 @@ if 'elev_df' in locals() and not elev_df.empty:
                      color=colors_flowline[i], linewidth=1, marker='o', markersize=2.5, alpha=0.8)
 
 ax5.axvline(plot_landslide_date, color='k', linestyle='--', linewidth=1.5, zorder=10)
-# Dynamic y position for landslide text
 y_max_e = ax5.get_ylim()[1] if not elev_df.empty else 1
-ax5.text(plot_landslide_date - pd.Timedelta(days=3), y_max_e, 'Landslide', 
-         rotation=90, va='top', ha='right', fontsize=8)
+y_min_e = ax5.get_ylim()[0] if not elev_df.empty else -40
+ax5.text(plot_landslide_date - pd.Timedelta(days=15), y_min_e+2.5, 'Landslide', 
+         rotation=90, va='bottom', ha='right', fontsize=8)
 
-#ax5.set_xlim([start_date, end_date]) # comment to show full timeseriies/uncomment to clip to Jan-18 to Jul-19
 ax5.set_ylabel("$\Delta z$ (m)", fontsize=8)
 ax5.tick_params(axis='both', which='major', labelsize=8)
 ax5.grid(True, linestyle=':', alpha=0.6)
