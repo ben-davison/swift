@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.signal import savgol_filter
 from functools import lru_cache
 import rasterio
+from rasterio.fill import fillnodata
 import rioxarray as rxr
 import xarray as xr
 import geopandas as gpd
@@ -30,7 +31,7 @@ mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
 mpl.rcParams['svg.fonttype'] = 'none'
 
-# ==========================================
+# ========================================== 20180414_038_0811_F2_db
 # 1. PATH DEFINITIONS
 # ==========================================
 BASE_DIR = "/mnt/parscratch/users/gg1bjd/research/swift/data"
@@ -62,7 +63,7 @@ S1_BG_OUT = f"{PUB_IMG_DIR}/s1_backscatter_cropped.tif"
 S1_RAW_S = f"{BASE_DIR}/raw/vel/sentinel1/20180414_20180426_038_0811_F2_speed.tif"
 S1_RAW_U = f"{BASE_DIR}/raw/vel/sentinel1/20180414_20180426_038_0811_F2_U.tif"
 S1_RAW_V = f"{BASE_DIR}/raw/vel/sentinel1/20180414_20180426_038_0811_F2_V.tif"
-S1_RAW_DB = f"{BASE_DIR}/raw/images/sentinel1/20180402_20180414_038_0811_F2_db.tif"
+S1_RAW_DB = f"{BASE_DIR}/raw/images/sentinel1/20180414_038_0811_F2_db.tif"
 
 ZARR_ANTARCTICA = "/mnt/parscratch/users/gg1bjd/Data/Velocity/Antarctica/multisource_zarr/antarctica_multisource_velocity_optimized.zarr"
 
@@ -100,6 +101,15 @@ def load_and_resample(file_path, match_grid, nodata=-9999):
     da = rxr.open_rasterio(file_path, masked=True).squeeze()
     da = da.where(da != nodata)
     return da.rio.reproject_match(match_grid)
+
+def inpaint_nans(da, max_search_distance=100.0):
+    """Fills NaN gaps in a 2D DataArray using inverse distance weighting interpolation."""
+    arr = da.values.copy()
+    mask = ~np.isnan(arr)  # Valid pixel mask
+    if np.any(~mask):
+        filled_arr = fillnodata(arr, mask=mask, max_search_distance=max_search_distance)
+        da = da.copy(data=filled_arr)
+    return da
 
 def generate_flowline_points(shp_path, spacing=500):
     gdf = gpd.read_file(shp_path)
@@ -385,6 +395,9 @@ else:
     s1_s = load_and_resample(S1_RAW_S, master_grid)
     s1_db = load_and_resample(S1_RAW_DB, master_grid)
     
+    # Inpaint NaN values in backscatter image before caching
+    s1_db = inpaint_nans(s1_db, max_search_distance=5.0)
+    
     s1_change_pct = ((s1_s - pre_S) / pre_S) * 100
     
     s1_change_pct.rio.to_raster(S1_S_CHANGE_OUT)
@@ -547,7 +560,21 @@ def format_map_axes(ax):
     ax.tick_params(axis='both', which='major', labelsize=8)
 
 # --- Panel A ---
-hs = hillshade(rema_dem.values)
+# hs = hillshade(rema_dem.values)
+hs_raw = hillshade(rema_dem.values)
+
+# Extract valid, non-zero hillshade values for percentile calculation
+valid_hs = hs_raw[np.isfinite(hs_raw) & (hs_raw > 0)]
+
+if valid_hs.size > 0:
+    vmin_val = np.percentile(valid_hs, 2)
+    vmax_val = np.percentile(valid_hs, 98)
+    # Clip extreme values and rescale to 0-1 range to maximize contrast
+    hs_clipped = np.clip(hs_raw, vmin_val, vmax_val)
+    hs = (hs_clipped - vmin_val) / (vmax_val - vmin_val)
+else:
+    hs = hs_raw
+    
 batlow_colors = cmc.batlow(np.linspace(0.15, 1.0, 256))
 batlow_light = LinearSegmentedColormap.from_list('batlow_light', batlow_colors)
 
@@ -577,9 +604,9 @@ for idx, row in term_gdf.iterrows():
     c = date_cmap(date_norm(row.date_num))
     if geom.geom_type == 'MultiLineString':
         for line in geom.geoms:
-            ax1.plot(*line.xy, color=c, linewidth=0.1, zorder=6)
+            ax1.plot(*line.xy, color=c, linewidth=0.5, zorder=6)
     else:
-        ax1.plot(*geom.xy, color=c, linewidth=1.5, zorder=6)
+        ax1.plot(*geom.xy, color=c, linewidth=0.5, zorder=6)
 
 sm_date = plt.cm.ScalarMappable(cmap=date_cmap, norm=date_norm)
 sm_date.set_array([])
@@ -598,13 +625,81 @@ ax1.quiver(X[::step, ::step], Y[::step, ::step], pre_U.values[::step, ::step], p
 for i, point in enumerate(flowline_pts.geometry):
     ax1.plot(point.x, point.y, marker='o', markersize=3, color=colors_flowline[i], markeredgecolor='k', markeredgewidth=0.3)
 
+# --- BRACKETS & LABELS FOR GROUPS (PANEL A)
+all_site_indices = list(flowline_pts.index)
+map_groups = [
+    {"label": "Group 1", "indices": [i for i in all_site_indices if 0 <= i <= 3]},
+    {"label": "Group 2", "indices": [i for i in all_site_indices if 4 <= i <= 12]},
+    {"label": "Group 3", "indices": [i for i in all_site_indices if 13 <= i <= 17]}
+]
+
+# Spacing parameters in map meters (adjust if needed for your map extent)
+offset_dist = 400    # Distance of bracket spine to the right of the points
+cap_len = 150        # Length of bracket end caps pointing back to points
+text_offset = 200    # Distance of text label to the right of bracket spine
+
+for grp in map_groups:
+    idxs = grp["indices"]
+    if not idxs:
+        continue
+
+    # Get start (upstream) and end (downstream) points of the group
+    p_start = flowline_pts.geometry.iloc[idxs[0]]
+    p_end = flowline_pts.geometry.iloc[idxs[-1]]
+
+    dx = p_end.x - p_start.x
+    dy = p_end.y - p_start.y
+    norm = np.hypot(dx, dy)
+
+    if norm == 0:
+        continue
+
+    # Normal vector perpendicular to flowline
+    nx = dy / norm
+    ny = -dx / norm
+
+    # Force normal vector towards +X (right side of map frame)
+    if nx < 0:
+        nx, ny = -nx, -ny
+
+    # Shifted bracket start and end coordinates
+    b_start_x = p_start.x + nx * offset_dist
+    b_start_y = p_start.y + ny * offset_dist
+    b_end_x = p_end.x + nx * offset_dist
+    b_end_y = p_end.y + ny * offset_dist
+
+    # Cap coordinates (extend back towards the flowline points)
+    cap_start_x = b_start_x - nx * cap_len
+    cap_start_y = b_start_y - ny * cap_len
+    cap_end_x = b_end_x - nx * cap_len
+    cap_end_y = b_end_y - ny * cap_len
+
+    darkest_color = colors_flowline[max(idxs)]
+
+    # Draw square bracket (cap -> spine -> cap)
+    ax1.plot([cap_start_x, b_start_x, b_end_x, cap_end_x],
+             [cap_start_y, b_start_y, b_end_y, cap_end_y],
+             color=darkest_color, linewidth=1.2, zorder=15)
+
+    # Label at center of bracket spine, offset further to the right
+    mid_x = (b_start_x + b_end_x) / 2 + nx * text_offset
+    mid_y = (b_start_y + b_end_y) / 2 + ny * text_offset
+
+    # Use a dark box background for Group 1 to ensure high contrast against pale text
+    box_bg = 'black' if grp["label"] == "Group 1" else 'white'
+
+    ax1.text(mid_x, mid_y, grp["label"], color=darkest_color,
+             fontsize=6, fontweight='bold', ha='left', va='center', zorder=20,
+             bbox=dict(facecolor=box_bg, edgecolor='none', alpha=0.8, pad=1.0))
+
+# FORMATTING    
 format_map_axes(ax1)
-sb_len = 2000  
-sb_x = extent[0] + (extent[1] - extent[0]) * 0.05
-sb_y = extent[2] + (extent[3] - extent[2]) * 0.05
-ax1.plot([sb_x, sb_x + sb_len], [sb_y, sb_y], color='k', linewidth=2, solid_capstyle='butt')
-ax1.text(sb_x + sb_len/2, sb_y + (extent[3] - extent[2]) * 0.02, '2 km', 
-         color='k', fontsize=8, ha='center', va='bottom', fontweight='bold')
+#sb_len = 2000  
+#sb_x = extent[0] + (extent[1] - extent[0]) * 0.05
+#sb_y = extent[2] + (extent[3] - extent[2]) * 0.05
+#ax1.plot([sb_x, sb_x + sb_len], [sb_y, sb_y], color='w', linewidth=2, solid_capstyle='butt')
+#ax1.text(sb_x + sb_len/2, sb_y + (extent[3] - extent[2]) * 0.02, '2 km', 
+#         color='w', fontsize=8, ha='center', va='bottom', fontweight='bold')
 ax1.set_xlim([extent[0], extent[1]])
 ax1.set_ylim([extent[2], extent[3]])
 
@@ -682,7 +777,7 @@ for i, idx in enumerate(flowline_pts.index):
             
             # Plot tiny 'x' markers on detected peaks so the calculation is fully transparent
             ax3.plot(valid_dates[max_idx], valid_smoothed[max_idx], marker='x', 
-                     color='black', markersize=3.5, alpha=0.8, zorder=12)
+                     color='#005F73', markersize=3.5, alpha=0.8, zorder=12)
 
 if len(peak_dates) > 1:
     x_mdates = mdates.date2num(peak_dates)
@@ -691,7 +786,7 @@ if len(peak_dates) > 1:
     # Because we expanded the time window, max(x_mdates) now covers the whole span
     x_line = np.linspace(min(x_mdates), max(x_mdates), 100)
     y_line = np.polyval(p_amp, x_line)
-    ax3.plot(mdates.num2date(x_line), y_line, color='grey', linestyle='--', linewidth=1, zorder=15)
+    ax3.plot(mdates.num2date(x_line), y_line, color='#005F73', linestyle='--', linewidth=1, zorder=15) # grey
     
     base_date = min(peak_dates)
     days_since = np.array([(d - base_date).total_seconds() / (24*3600) for d in peak_dates])
@@ -704,7 +799,7 @@ if len(peak_dates) > 1:
     
     text_str = f"Wave Speed: {wave_speed_m_day:.1f} m day$^{{-1}}$"
     ax3.text(0.98, 0.95, text_str, transform=ax3.transAxes, fontsize=7, 
-             ha='right', va='top', zorder=20)
+             ha='right', va='top', zorder=20, color='#005F73')
     
     WAVE_METRICS_CSV = f"{PUB_VEL_DIR}/wave_metrics.csv"
     metrics_df = pd.DataFrame({
@@ -716,6 +811,7 @@ if len(peak_dates) > 1:
     metrics_df.to_csv(WAVE_METRICS_CSV, index=False)
 
 plot_landslide_date = landslide_date - pd.Timedelta(days=5)
+plot_landslide_date_right = landslide_date + pd.Timedelta(days=5)
 ax3.axvline(plot_landslide_date, color='k', linestyle='--', linewidth=1.5, zorder=10)
 ax3.text(plot_landslide_date - pd.Timedelta(days=3), ax3.get_ylim()[1], 'Landslide', 
          rotation=90, va='top', ha='right', fontsize=8)
@@ -749,19 +845,112 @@ ax4.grid(True, linestyle=':', alpha=0.6)
 
 # --- Panel E ---
 if 'elev_df' in locals() and not elev_df.empty:
+    # 1. Plot individual site raw timeseries lines
     for i, idx in enumerate(flowline_pts.index):
         site_name = f"Site_{idx}"
         site_elev = elev_df[elev_df['site_id'] == site_name].sort_values('Date')
-        
         if not site_elev.empty:
             ax5.plot(site_elev['Date'], site_elev['elevation_change'], 
-                     color=colors_flowline[i], linewidth=1, marker='o', markersize=2.5, alpha=0.8)
+                     color=colors_flowline[i], linewidth=0.8, marker='o', markersize=2, alpha=0.5)
+
+    # 2. Define the three regions
+    all_site_indices = list(flowline_pts.index)
+    regions = [
+        {"name": "1", "indices": [i for i in all_site_indices if 0 <= i <= 3]},
+        {"name": "2", "indices": [i for i in all_site_indices if 4 <= i <= 12]},
+        {"name": "3", "indices": [i for i in all_site_indices if 13 <= i <= 17]}
+    ]
+
+    post_start_date = pd.to_datetime('2019-01-01')
+
+    # Table layout coordinates (in axis-fraction units)
+    x_cols = [0.03, 0.14, 0.27]  # X positions for: Group, Pre-, Post-landslide
+    y_pos = 0.20                 # Starting top Y coordinate for header
+    y_step = 0.055               # Vertical row spacing
+
+    # Table Headers (Bold)
+    ax5.text(x_cols[0], y_pos, "Group", transform=ax5.transAxes, color='black', 
+             fontsize=6.5, fontweight='bold', va='bottom', ha='left')
+    ax5.text(x_cols[1], y_pos, "Pre-", transform=ax5.transAxes, color='black', 
+             fontsize=6.5, fontweight='bold', va='bottom', ha='left')
+    ax5.text(x_cols[2], y_pos, "Post-landslide", transform=ax5.transAxes, color='black', 
+             fontsize=6.5, fontweight='bold', va='bottom', ha='left')
+
+    # 3. Process each region & populate table rows
+    for reg in regions:
+        reg_indices = reg["indices"]
+        if not reg_indices:
+            continue
+
+        y_pos -= y_step
+        darkest_color = colors_flowline[max(reg_indices)]
+
+        pre_slopes = []
+        post_slopes = []
+
+        for s_idx in reg_indices:
+            s_elev = elev_df[elev_df['site_idx'] == s_idx].sort_values('Date')
+            if s_elev.empty:
+                continue
+
+            # Pre-landslide
+            pre_df = s_elev[s_elev['Date'] < landslide_date]
+            if len(pre_df) >= 2:
+                p_pre = np.polyfit(mdates.date2num(pre_df['Date']), pre_df['elevation_change'].values, 1)
+                pre_slopes.append(p_pre[0] * 365.25)
+
+            # Post-landslide (2019 onwards)
+            post_df = s_elev[s_elev['Date'] >= post_start_date]
+            if len(post_df) >= 2:
+                p_post = np.polyfit(mdates.date2num(post_df['Date']), post_df['elevation_change'].values, 1)
+                post_slopes.append(p_post[0] * 365.25)
+
+        # Regional mean best-fit lines
+        reg_df = elev_df[elev_df['site_idx'].isin(reg_indices)]
+        reg_mean_ts = reg_df.groupby('Date')['elevation_change'].mean().reset_index().sort_values('Date')
+
+        # Pre line
+        pre_mean_df = reg_mean_ts[reg_mean_ts['Date'] < landslide_date]
+        if len(pre_mean_df) >= 2:
+            x_pre_num = mdates.date2num(pre_mean_df['Date'])
+            p_pre_reg = np.polyfit(x_pre_num, pre_mean_df['elevation_change'].values, 1)
+            x_pre_fit = np.linspace(x_pre_num.min(), x_pre_num.max(), 50)
+            y_pre_fit = np.polyval(p_pre_reg, x_pre_fit)
+            ax5.plot(mdates.num2date(x_pre_fit), y_pre_fit, 
+                     color=darkest_color, linestyle='--', linewidth=1.5, zorder=6)
+
+        # Post line (2019 onwards)
+        post_mean_df = reg_mean_ts[reg_mean_ts['Date'] >= post_start_date]
+        if len(post_mean_df) >= 2:
+            x_post_num = mdates.date2num(post_mean_df['Date'])
+            p_post_reg = np.polyfit(x_post_num, post_mean_df['elevation_change'].values, 1)
+            x_post_fit = np.linspace(x_post_num.min(), x_post_num.max(), 50)
+            y_post_fit = np.polyval(p_post_reg, x_post_fit)
+            ax5.plot(mdates.num2date(x_post_fit), y_post_fit, 
+                     color=darkest_color, linestyle='--', linewidth=1.5, zorder=6)
+
+        # Statistics calculations
+        mean_pre = np.mean(pre_slopes) if len(pre_slopes) > 0 else np.nan
+        std_pre = np.std(pre_slopes, ddof=1) if len(pre_slopes) > 1 else 0.0
+        mean_post = np.mean(post_slopes) if len(post_slopes) > 0 else np.nan
+        std_post = np.std(post_slopes, ddof=1) if len(post_slopes) > 1 else 0.0
+
+        pre_str = f"{mean_pre:+.1f}±{std_pre:.1f}" if not np.isnan(mean_pre) else "N/A"
+        post_str = f"{mean_post:+.1f}±{std_post:.1f} m yr$^{{-1}}$" if not np.isnan(mean_post) else "N/A"
+
+        # Table Row Values (Normal Weight, Colored by Region)
+        ax5.text(x_cols[0], y_pos, reg['name'], transform=ax5.transAxes, color=darkest_color, 
+                 fontsize=6.5, fontweight='normal', va='bottom', ha='left')
+        ax5.text(x_cols[1], y_pos, pre_str, transform=ax5.transAxes, color=darkest_color, 
+                 fontsize=6.5, fontweight='normal', va='bottom', ha='left')
+        ax5.text(x_cols[2], y_pos, post_str, transform=ax5.transAxes, color=darkest_color, 
+                 fontsize=6.5, fontweight='normal', va='bottom', ha='left')
 
 ax5.axvline(plot_landslide_date, color='k', linestyle='--', linewidth=1.5, zorder=10)
 y_max_e = ax5.get_ylim()[1] if not elev_df.empty else 1
 y_min_e = ax5.get_ylim()[0] if not elev_df.empty else -40
-ax5.text(plot_landslide_date - pd.Timedelta(days=15), y_min_e+2.5, 'Landslide', 
-         rotation=90, va='bottom', ha='right', fontsize=8)
+ax5.text(plot_landslide_date + pd.Timedelta(days=25), y_min_e + 2.5, 'Landslide', # Landslide
+         rotation=90, va='bottom', ha='left', fontsize=8)
 
 ax5.set_ylabel("$\Delta z$ (m)", fontsize=8)
 ax5.tick_params(axis='both', which='major', labelsize=8)
